@@ -8,6 +8,7 @@
 #include <linux/time.h>
 
 #define TDMM_HEAP_BYTES (64u * 1024u * 1024u)
+#define max(a, b) ((a) > (b) ? (a) : (b))
 
 typedef struct block_hdr {
     size_t size;
