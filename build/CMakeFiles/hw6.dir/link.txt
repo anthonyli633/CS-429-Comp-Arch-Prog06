@@ -1,0 +1,1 @@
+/usr/bin/cc CMakeFiles/hw6.dir/main.c.o -o hw6  libtdmm/libtdmm.a 
