@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdio.h>
-#include <linux/time.h>
 
 #define TDMM_HEAP_BYTES (64u * 1024u * 1024u)
 #define max(a, b) ((a) > (b) ? (a) : (b))
@@ -27,21 +26,17 @@ typedef struct {
     // Utilization
     double util_sum;
     size_t num_util;
-    // Time
-    uint64_t malloc_ns_total, free_ns_total;
 } tdmm_metrics_t;
-
-static uint64_t now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 
 static void *g_heap_base = NULL;
 static size_t g_heap_size = 0;
 static block_hdr_t *g_head = NULL;
 static alloc_strat_e g_strat = FIRST_FIT;
 static tdmm_metrics_t g_metrics = {0};
+
+const tdmm_metrics_t *t_metrics_ptr(void) {
+    return &g_metrics;
+}
 
 static size_t ALIGN4(size_t x) {
     return (x + 3) / 4 * 4;
@@ -135,14 +130,16 @@ typedef enum {
     METRIC_FREE,
 } metric_event_t;
 
+size_t t_overhead_bytes(void) {
+    size_t blocks = 0;
+    for (block_hdr_t *cur = g_head; cur; cur = cur->next) {
+        blocks++;
+    }
+    return blocks * hdr_size();
+}
 
-static void update_metrics(metric_event_t ev, size_t req_bytes, size_t actual_bytes, uint64_t t0_ns, uint64_t t1_ns) {
+static void update_metrics(metric_event_t ev, size_t req_bytes, size_t actual_bytes) {
     g_metrics.bytes_from_os = g_heap_size;
-
-    uint64_t dt = (t1_ns >= t0_ns) ? (t1_ns - t0_ns) : 0;
-    if (ev == METRIC_MALLOC) g_metrics.malloc_ns_total += dt;
-    else if (ev == METRIC_FREE) g_metrics.free_ns_total += dt;
-
     if (ev == METRIC_MALLOC) {
         g_metrics.cur_inuse_bytes += actual_bytes;
         g_metrics.peak_inuse_bytes = max(g_metrics.peak_inuse_bytes, g_metrics.cur_inuse_bytes);
@@ -155,38 +152,6 @@ static void update_metrics(metric_event_t ev, size_t req_bytes, size_t actual_by
         g_metrics.util_sum += u;
         g_metrics.num_util += 1;
     }
-}
-
-void display_metrics(void) {
-    printf("\n===== TDMM METRICS =====\n");
-
-    printf("OS bytes (mmap):        %zu\n", g_metrics.bytes_from_os);
-    printf("Current in-use bytes:   %zu\n", g_metrics.cur_inuse_bytes);
-    printf("Peak in-use bytes:      %zu\n", g_metrics.peak_inuse_bytes);
-
-    double peak_util = 0.0;
-    if (g_metrics.bytes_from_os > 0)
-        peak_util = (double)g_metrics.peak_inuse_bytes /
-                    (double)g_metrics.bytes_from_os;
-
-    double avg_util = 0.0;
-    if (g_metrics.num_util > 0)
-        avg_util = g_metrics.util_sum /
-                   (double)g_metrics.num_util;
-
-    printf("Peak utilization:       %.6f\n", peak_util);
-    printf("Average utilization:    %.6f\n", avg_util);
-
-    printf("Total malloc time (ns): %llu\n",
-           (unsigned long long)g_metrics.malloc_ns_total);
-    printf("Total free time (ns):   %llu\n",
-           (unsigned long long)g_metrics.free_ns_total);
-
-    if (g_metrics.num_util > 0) {
-        printf("Samples taken:          %zu\n", g_metrics.num_util);
-    }
-
-    printf("========================\n\n");
 }
 
 void t_init(alloc_strat_e strat) {
@@ -211,42 +176,39 @@ void t_init(alloc_strat_e strat) {
     g_head->prev = NULL;
     g_head->next = NULL;
 
-    update_metrics(METRIC_INIT, 0, 0, 0, 0);
+    g_metrics = (tdmm_metrics_t){0};
+    update_metrics(METRIC_INIT, 0, 0);
 }
 
 void *t_malloc(size_t size) {
-    uint64_t t0 = now();
-
-    if (size == 0) { update_metrics(METRIC_MALLOC, 0, 0, t0, now()); return NULL; }
+    if (size == 0) { update_metrics(METRIC_MALLOC, 0, 0); return NULL; }
     if (!g_heap_base) t_init(g_strat);
-    if (!g_heap_base) { update_metrics(METRIC_MALLOC, size, 0, t0, now()); return NULL; }
+    if (!g_heap_base) { update_metrics(METRIC_MALLOC, size, 0); return NULL; }
 
     size_t need = ALIGN4(size);
     block_hdr_t *b = find_block(need);
-    if (!b) { update_metrics(METRIC_MALLOC, size, 0, t0, now()); return NULL; }
+    if (!b) { update_metrics(METRIC_MALLOC, size, 0); return NULL; }
 
     split_block(b, need);
     b->free = 0;
 
     void *p = payload_from_hdr(b);
-    if ((uintptr_t)p % 4 != 0) { update_metrics(METRIC_MALLOC, size, 0, t0, now()); return NULL; }
+    if ((uintptr_t)p % 4 != 0) { update_metrics(METRIC_MALLOC, size, 0); return NULL; }
 
-    update_metrics(METRIC_MALLOC, size, need, t0, now());
+    update_metrics(METRIC_MALLOC, size, need);
     return p;
 }
 
 void t_free(void *ptr) {
-    uint64_t t0 = now();
-
-    if (!ptr) { update_metrics(METRIC_FREE, 0, 0, t0, now()); return; }
-    if (!ptr_in_heap(ptr)) { update_metrics(METRIC_FREE, 0, 0, t0, now()); return; }
+    if (!ptr) { update_metrics(METRIC_FREE, 0, 0); return; }
+    if (!ptr_in_heap(ptr)) { update_metrics(METRIC_FREE, 0, 0); return; }
 
     block_hdr_t *b = hdr_from_payload(ptr);
-    if (!ptr_in_heap(b)) { update_metrics(METRIC_FREE, 0, 0, t0, now()); return; }
-    if (b->free) { update_metrics(METRIC_FREE, 0, 0, t0, now()); return; }
+    if (!ptr_in_heap(b)) { update_metrics(METRIC_FREE, 0, 0); return; }
+    if (b->free) { update_metrics(METRIC_FREE, 0, 0); return; }
 
     size_t freed = b->size;
     b->free = 1;
     merge(b);
-    update_metrics(METRIC_FREE, 0, freed, t0, now());
+    update_metrics(METRIC_FREE, 0, freed);
 }
